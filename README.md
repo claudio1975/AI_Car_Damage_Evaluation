@@ -5,12 +5,12 @@
 ![requests](https://img.shields.io/badge/requests-2.32.5-yellow)
 ![gradio](https://img.shields.io/badge/gradio-6.0.1-blue)
 
-# Car Damage with local evaluation and body shops search**
+# Car Damage with local evaluation and body shops search
 
 **Run locally**
 
-`
-clone the repository
+```
+-clone the repository
 
 git clone https://github.com/claudio1975/AI_Car_Damage_Evaluation.git
 
@@ -33,7 +33,7 @@ pip install -r requirements - gradio.txt # for gradio app
 python app_gradio_multiagent.py # gradio app
 
 streamlit run app_streamlit_multiagent.py # streamlit app
-`
+```
 
 **Run on web**
 
