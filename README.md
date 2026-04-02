@@ -37,7 +37,55 @@ streamlit run app_streamlit_multiagent.py # streamlit app
 
 **Run on web**
 
-go to streamlit app -> https://aicardamageevaluation.streamlit.app/
-
 go to hugging face app: -> https://huggingface.co/spaces/towardsinnovationlab/AI_Car_Damage_Evaluation
 
+go to streamlit app -> https://aicardamageevaluation.streamlit.app/
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    GRADIO WEB INTERFACE                             │
+│                                                                     │
+│  [Photo Upload]  [Location Input]  [API Keys]  [Analyze Button]     |
+│                                                                     │
+│  Outputs: Damage Description │ OEM Quote │ Aftermarket Quote │ Shops│
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ analyze_with_multi_agent_system()
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     ORCHESTRATOR AGENT                              │
+│                                                                     │
+│  1. orchestrator_plan()  →  builds execution plan (priority queue)  │
+│  2. orchestrator_execute() → coordinates agents in priority order   │
+│  3. Aggregates & returns results to UI                              │
+└────┬──────────────────┬──────────────────────┬──────────────────────┘
+     │ priority 1       │ priority 2            │ priority 3
+     ▼                  ▼                       ▼
+┌──────────┐   ┌────────────────────────────┐  ┌──────────────────────┐
+│  VISION  │   │      COST AGENTS (x2)      │  │   SHOP FINDER AGENT  │
+│  AGENT   │   │                            │  │                      │
+│          │   │ ┌──────────┐ ┌──────────┐  │  │  shop_finder_search()│
+│ perceive │   │ │  OEM /   │ │Aftermkt/ │  │  │                      │
+│  image   │   │ │ Dealer   │ │Independ. │  │  │  Needs: location     │
+│          │   │ └────┬─────┘ └────┬─────┘  │  │  Skips if no loc.    |
+│ Detects  │   │      │            │        │  └──────────┬───────────┘
+│ severity │   │ cost_agent_estimate()      │             │
+│ (auto)   │   └────────────────────────────┘             │
+└────┬─────┘            │            │                    │
+     │                  │            │                    │
+     │  damage_info     │            │                    │
+     │ (desc+severity)  │            │                    │
+     └──────────────────┘            │                    │
+                                     │                    │
+┌────────────────────────────────────▼────────────────────▼──────────┐
+│                        EXTERNAL APIs                               │
+│                                                                    │
+│  ┌──────────────────────────┐    ┌──────────────────────────────┐  │
+│  │  OpenAI API              │    │  Perplexity API              │  │
+│  │  model: gpt-5.2          │    │  model: sonar-pro            │  │
+│  │  (Vision Agent only)     │    │  (Cost Agents + Shop Finder) │  │
+│  │  → Image analysis        │    │  → Cost estimates (JSON)     │  │
+│  │  → Damage description    │    │  → Local shop search         │  │
+│  └──────────────────────────┘    └──────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+
+```
