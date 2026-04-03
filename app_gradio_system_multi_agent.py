@@ -98,7 +98,8 @@ def create_agent_state(agent_type, config=None):
         'last_action': None,
         'timestamp': datetime.now().isoformat(),
         'config': config or {},
-        'performance_history': []
+        'performance_history': [],
+        'react_trace': []  
     }
 
 def update_agent_memory(agent_state, event):
@@ -145,6 +146,62 @@ def agent_decide(agent_state, context):
 
     return decision
 
+# --- ReAct Loop ---
+
+def react_thought(agent_state, thought_text):
+    """Record a Thought step in the ReAct loop"""
+    step = {
+        'step': 'Thought',
+        'content': thought_text,
+        'timestamp': datetime.now().isoformat()
+    }
+    agent_state['react_trace'].append(step)
+    return agent_state
+
+def react_action(agent_state, action_name, action_input=None):
+    """Record an Action step in the ReAct loop"""
+    step = {
+        'step': 'Action',
+        'content': action_name,
+        'input': action_input,
+        'timestamp': datetime.now().isoformat()
+    }
+    agent_state['react_trace'].append(step)
+    return agent_state
+
+def react_observation(agent_state, observation_text):
+    """Record an Observation step in the ReAct loop"""
+    step = {
+        'step': 'Observation',
+        'content': observation_text,
+        'timestamp': datetime.now().isoformat()
+    }
+    agent_state['react_trace'].append(step)
+    return agent_state
+
+def react_run_loop(agent_state, thought_text, action_name, action_fn, action_input=None):
+    """
+    Execute a single Thought → Action → Observation ReAct iteration.
+    - thought_text : reasoning string before acting
+    - action_name  : label for the action being taken
+    - action_fn    : callable that performs the action; receives action_input, returns (result, observation_text)
+    - action_input : optional data passed to action_fn
+    Returns (agent_state, result)
+    """
+    # Thought
+    agent_state = react_thought(agent_state, thought_text)
+
+    # Action
+    agent_state = react_action(agent_state, action_name, action_input)
+
+    # Execute and get Observation
+    result, observation_text = action_fn(action_input)
+
+    # Observation
+    agent_state = react_observation(agent_state, observation_text)
+
+    return agent_state, result
+
 # --- Helper Functions ---
 
 def detect_currency_from_location(location):
@@ -177,7 +234,7 @@ def create_vision_agent(api_key):
     return agent_state
 
 def vision_agent_perceive(agent_state, image):
-    """Vision agent perceives and analyzes the image"""
+    """Vision agent perceives and analyzes the image using a ReAct loop"""
     decision = agent_decide(agent_state, {'has_image': image is not None})
 
     if decision['action'] != 'analyze_image':
@@ -190,26 +247,87 @@ def vision_agent_perceive(agent_state, image):
 
     img_base64 = image_to_base64(image)
 
-    payload = {
+    # --- ReAct loop ---
+    def call_vision_api(payload):
+        response = requests.post(OPENAI_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        raw = result['choices'][0]['message']['content'].strip()
+
+        # Strip markdown fences if present
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```$', '', raw, flags=re.MULTILINE)
+        raw = raw.strip()
+
+        # Parse structured JSON returned by the model
+        vision_data = None
+        json_match = re.search(r'\{[\s\S]*\}', raw)
+        if json_match:
+            try:
+                vision_data = json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        if vision_data is None:
+            try:
+                vision_data = json.loads(raw)
+            except json.JSONDecodeError:
+                vision_data = {}
+
+        # Normalise severity — model returns exactly one of: minor / moderate / severe
+        severity = vision_data.get('severity', 'moderate').strip().lower()
+        if severity not in ('minor', 'moderate', 'severe'):
+            severity = 'moderate'
+
+        description = vision_data.get('description', raw)
+        confidence = float(vision_data.get('confidence', 0.9))
+
+        result_data = {
+            'description': description,
+            'severity': severity,
+            'confidence': confidence,
+            'damaged_parts': vision_data.get('damaged_parts', []),
+            'damage_type': vision_data.get('damage_type', ''),
+            'observations': vision_data.get('observations', '')
+        }
+        observation = (
+            f"Vision API responded successfully. "
+            f"Detected severity: {severity}. "
+            f"Confidence: {confidence:.0%}."
+        )
+        return result_data, observation
+
+    api_payload = {
         "model": OPENAI_VISION_MODEL,
         "messages": [
             {
                 "role": "system",
-                "content": "You are an expert auto damage evaluator. Analyze images with precision, detail and assess damage severity."
+                "content": (
+                    "You are an expert auto damage evaluator. "
+                    "You always respond with a single valid JSON object and nothing else — "
+                    "no prose, no markdown fences."
+                )
             },
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": """Analyze this car damage image. Provide:
-1. Overall description of the damage
-2. Specific parts that are damaged (be precise with part names)
-3. Severity of damage (minor, moderate, severe)
-4. Type of damage (collision, scratch, dent, etc.)
-5. Any additional observations
+                        "text": """Analyze this car damage image and respond ONLY with this JSON structure:
+{
+  "description": "Detailed technical description of all visible damage",
+  "damaged_parts": ["list", "of", "specific", "part", "names"],
+  "damage_type": "e.g. rust, scratch, dent, collision, paint peel",
+  "severity": "minor OR moderate OR severe",
+  "confidence": 0.0 to 1.0,
+  "observations": "Any additional relevant observations"
+}
 
-Be specific and technical in your assessment."""
+Severity scale:
+- minor: surface scratches, small chips, light scuffs — no structural impact
+- moderate: dents, localised rust, cracked bumper — panel repair needed
+- severe: deep rust perforation, major collision deformation, frame damage
+
+Reply with JSON only."""
                     },
                     {
                         "type": "image_url",
@@ -218,34 +336,33 @@ Be specific and technical in your assessment."""
                 ]
             }
         ],
-        "max_completion_tokens": 1000
+        "max_completion_tokens": 600
     }
 
-    response = requests.post(OPENAI_API_URL, headers=headers, json=payload)
-    response.raise_for_status()
+    agent_state, result_data = react_run_loop(
+        agent_state,
+        thought_text=(
+            "I have received a car damage image. "
+            "I need to call the vision model to identify damaged parts, "
+            "assess the severity, and extract a structured description."
+        ),
+        action_name="call_openai_vision_api",
+        action_fn=call_vision_api,
+        action_input=api_payload
+    )
 
-    result = response.json()
-    analysis = result['choices'][0]['message']['content']
-
-    # Determine severity from analysis
-    severity = 'moderate'
-    if 'severe' in analysis.lower() or 'major' in analysis.lower():
-        severity = 'severe'
-    elif 'minor' in analysis.lower() or 'light' in analysis.lower():
-        severity = 'minor'
+    # Guard against None result
+    if not result_data:
+        result_data = {'description': 'Vision analysis unavailable.', 'severity': 'moderate', 'confidence': 0.0}
 
     # Update agent state
     agent_state = update_agent_memory(agent_state, {
         'action': 'image_analyzed',
-        'severity_detected': severity,
-        'confidence': 0.9
+        'severity_detected': result_data['severity'],
+        'confidence': result_data.get('confidence', 0.9)
     })
 
-    return agent_state, {
-        'description': analysis,
-        'severity': severity,
-        'confidence': 0.9
-    }
+    return agent_state, result_data
 
 # --- Cost Estimation Agent ---
 
@@ -259,7 +376,11 @@ def create_cost_agent(api_key, philosophy):
     return agent_state
 
 def cost_agent_estimate(agent_state, damage_info, location, currency):
-    """Cost agent generates repair estimate"""
+    """Cost agent generates repair estimate using a ReAct loop"""
+    # Guard: damage_info may be None if vision agent failed
+    if not damage_info:
+        damage_info = {'description': 'Car damage visible in uploaded image.', 'severity': 'moderate'}
+
     decision = agent_decide(agent_state, {
         'severity': damage_info.get('severity', 'moderate')
     })
@@ -273,10 +394,13 @@ def cost_agent_estimate(agent_state, damage_info, location, currency):
         "Content-Type": "application/json"
     }
 
+    damage_description = damage_info.get('description', 'Car damage visible in uploaded image.')
+    damage_severity = damage_info.get('severity', 'moderate')
+
     prompt = f"""Based on this car damage, provide repair cost estimate for {location} using {philosophy['description']}:
 
-Damage: {damage_info['description']}
-Severity: {damage_info.get('severity', 'moderate')}
+Damage: {damage_description}
+Severity: {damage_severity}
 
 Repair Philosophy:
 - Parts: {philosophy['parts_type']}
@@ -303,7 +427,7 @@ Requirements:
 - Based on {philosophy['name']} in {location}
 - ONLY JSON, no markdown"""
 
-    payload = {
+    api_payload = {
         "model": PERPLEXITY_MODEL,
         "messages": [
             {
@@ -319,43 +443,87 @@ Requirements:
         "temperature": 0.2
     }
 
-    response = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload)
-    response.raise_for_status()
+    # --- ReAct loop ---
+    def call_cost_api(payload):
+        response = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        response_text = result['choices'][0]['message']['content'].strip()
 
-    result = response.json()
-    response_text = result['choices'][0]['message']['content']
+        # Strip markdown code fences if present
+        response_text = re.sub(r'^```(?:json)?\s*', '', response_text, flags=re.MULTILINE)
+        response_text = re.sub(r'\s*```$', '', response_text, flags=re.MULTILINE)
+        response_text = response_text.strip()
 
-    # Extract JSON
-    json_match = re.search(r'\{[\s\S]*\}', response_text)
-    if json_match:
-        cost_data = json.loads(json_match.group())
-    else:
-        cost_data = json.loads(response_text)
+        # Extract JSON object
+        cost_data = None
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if json_match:
+            try:
+                cost_data = json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        if cost_data is None:
+            try:
+                cost_data = json.loads(response_text)
+            except json.JSONDecodeError:
+                # Fallback skeleton so the app never hard-crashes
+                cost_data = {
+                    'damage_summary': damage_description,
+                    'affected_parts': ['Unable to parse'],
+                    'estimated_cost_low': 0,
+                    'estimated_cost_high': 0,
+                    'currency': currency,
+                    'cost_breakdown': f'Cost estimation unavailable. Raw response: {response_text[:300]}',
+                    'repair_philosophy': philosophy['name'],
+                    'warranty_info': philosophy['warranty'],
+                    'sources': []
+                }
 
-    # Post-process: Convert dictionary cost_breakdown to natural language if needed
-    if isinstance(cost_data.get('cost_breakdown'), dict):
-        breakdown_dict = cost_data['cost_breakdown']
-        breakdown_text = "Costs include: "
+        # Post-process: Convert dictionary cost_breakdown to natural language if needed
+        if isinstance(cost_data.get('cost_breakdown'), dict):
+            breakdown_dict = cost_data['cost_breakdown']
+            breakdown_text = "Costs include: "
+            parts_info = []
+            labor_info = []
+            for key, value in breakdown_dict.items():
+                if isinstance(value, dict):
+                    for subkey, subvalue in value.items():
+                        if 'part' in subkey.lower() or 'material' in subkey.lower():
+                            parts_info.append(f"{subkey.replace('_', ' ')} ({subvalue} {currency})")
+                        elif 'labor' in subkey.lower() or 'hour' in subkey.lower():
+                            labor_info.append(f"{subkey.replace('_', ' ')} ({subvalue})")
+                elif isinstance(value, (int, float)):
+                    parts_info.append(f"{key.replace('_', ' ')} ({value} {currency})")
+            if parts_info:
+                breakdown_text += ", ".join(parts_info[:5])
+            if labor_info:
+                breakdown_text += "; Labor: " + ", ".join(labor_info[:3])
+            cost_data['cost_breakdown'] = (
+                breakdown_text if len(breakdown_text) > 20
+                else f"Estimate includes {philosophy['parts_type']} and {philosophy['labor_source']} labor rates for {location}."
+            )
 
-        parts_info = []
-        labor_info = []
+        low = cost_data.get('estimated_cost_low', 0)
+        high = cost_data.get('estimated_cost_high', 0)
+        observation = (
+            f"Cost API ({philosophy_key}) responded successfully. "
+            f"Estimated range: {currency_symbol}{low:,.0f} - {currency_symbol}{high:,.0f} {currency}."
+        )
+        return cost_data, observation
 
-        for key, value in breakdown_dict.items():
-            if isinstance(value, dict):
-                for subkey, subvalue in value.items():
-                    if 'part' in subkey.lower() or 'material' in subkey.lower():
-                        parts_info.append(f"{subkey.replace('_', ' ')} ({subvalue} {currency})")
-                    elif 'labor' in subkey.lower() or 'hour' in subkey.lower():
-                        labor_info.append(f"{subkey.replace('_', ' ')} ({subvalue})")
-            elif isinstance(value, (int, float)):
-                parts_info.append(f"{key.replace('_', ' ')} ({value} {currency})")
-
-        if parts_info:
-            breakdown_text += ", ".join(parts_info[:5])
-        if labor_info:
-            breakdown_text += "; Labor: " + ", ".join(labor_info[:3])
-
-        cost_data['cost_breakdown'] = breakdown_text if len(breakdown_text) > 20 else f"Estimate includes {philosophy['parts_type']} and {philosophy['labor_source']} labor rates for {location}."
+    agent_state, cost_data = react_run_loop(
+        agent_state,
+        thought_text=(
+            f"I have damage information with severity '{damage_severity}' "
+            f"and I need to generate a {decision['action']} for the '{philosophy_key}' repair philosophy "
+            f"in {location} using {currency}. "
+            f"I will query the Perplexity API with structured requirements."
+        ),
+        action_name="call_perplexity_cost_api",
+        action_fn=call_cost_api,
+        action_input=api_payload
+    )
 
     # Update agent memory
     agent_state = update_agent_memory(agent_state, {
@@ -377,7 +545,7 @@ def create_shop_finder_agent(api_key):
     return agent_state
 
 def shop_finder_search(agent_state, location):
-    """Shop finder agent searches for repair shops"""
+    """Shop finder agent searches for repair shops using a ReAct loop"""
     decision = agent_decide(agent_state, {'location': location})
 
     if decision['action'] == 'skip':
@@ -388,7 +556,7 @@ def shop_finder_search(agent_state, location):
         "Content-Type": "application/json"
     }
 
-    payload = {
+    api_payload = {
         "model": PERPLEXITY_MODEL,
         "messages": [
             {
@@ -414,11 +582,30 @@ Format clearly with sections."""
         "temperature": 0.2
     }
 
-    response = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload)
-    response.raise_for_status()
+    # --- ReAct loop ---
+    def call_shop_api(payload):
+        response = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        shops_text = result['choices'][0]['message']['content']
+        shop_count = shops_text.count('\n\n')
+        observation = (
+            f"Shop search API responded successfully for location '{location}'. "
+            f"Retrieved shop listings ({shop_count} sections found in response)."
+        )
+        return shops_text, observation
 
-    result = response.json()
-    shops_text = result['choices'][0]['message']['content']
+    agent_state, shops_text = react_run_loop(
+        agent_state,
+        thought_text=(
+            f"I need to find auto body repair shops near '{location}'. "
+            f"I will query Perplexity with a structured request for shop names, "
+            f"addresses, ratings, and contact details."
+        ),
+        action_name="call_perplexity_shop_search_api",
+        action_fn=call_shop_api,
+        action_input=api_payload
+    )
 
     agent_state = update_agent_memory(agent_state, {
         'action': 'shops_found',
@@ -438,32 +625,49 @@ def create_orchestrator():
     return agent_state
 
 def orchestrator_plan(orchestrator_state, inputs):
-    """Orchestrator creates execution plan based on inputs"""
-    plan = []
+    """Orchestrator creates execution plan based on inputs using a ReAct loop"""
 
-    if inputs.get('image'):
-        plan.append({
-            'agent': 'vision',
-            'priority': 1,
-            'reason': 'Image analysis required'
-        })
+    def build_plan(inp):
+        plan = []
+        if inp.get('image'):
+            plan.append({
+                'agent': 'vision',
+                'priority': 1,
+                'reason': 'Image analysis required'
+            })
+        if inp.get('location'):
+            plan.append({
+                'agent': 'cost_primary',
+                'priority': 2,
+                'reason': 'Primary quote needed'
+            })
+            plan.append({
+                'agent': 'cost_alternative',
+                'priority': 2,
+                'reason': 'Alternative quote for comparison'
+            })
+            plan.append({
+                'agent': 'shop_finder',
+                'priority': 3,
+                'reason': 'Find local repair shops'
+            })
+        observation = (
+            f"Execution plan built with {len(plan)} steps: "
+            + ", ".join(s['agent'] for s in plan) + "."
+        )
+        return plan, observation
 
-    if inputs.get('location'):
-        plan.append({
-            'agent': 'cost_primary',
-            'priority': 2,
-            'reason': 'Primary quote needed'
-        })
-        plan.append({
-            'agent': 'cost_alternative',
-            'priority': 2,
-            'reason': 'Alternative quote for comparison'
-        })
-        plan.append({
-            'agent': 'shop_finder',
-            'priority': 3,
-            'reason': 'Find local repair shops'
-        })
+    orchestrator_state, plan = react_run_loop(
+        orchestrator_state,
+        thought_text=(
+            f"I have received inputs with image={'yes' if inputs.get('image') else 'no'} "
+            f"and location='{inputs.get('location', 'not provided')}'. "
+            f"I need to determine which agents to activate and in what order."
+        ),
+        action_name="build_execution_plan",
+        action_fn=build_plan,
+        action_input=inputs
+    )
 
     orchestrator_state['config']['execution_plan'] = plan
     orchestrator_state = update_agent_memory(orchestrator_state, {
@@ -474,41 +678,64 @@ def orchestrator_plan(orchestrator_state, inputs):
     return orchestrator_state, plan
 
 def orchestrator_execute(orchestrator_state, plan, agents, context):
-    """Orchestrator executes the plan by coordinating agents"""
-    results = {}
+    """Orchestrator executes the plan by coordinating agents using a ReAct loop"""
 
-    for step in sorted(plan, key=lambda x: x['priority']):
-        agent_name = step['agent']
-        agent_state = agents.get(agent_name)
+    def run_all_steps(plan_and_context):
+        plan, context, agents_copy = plan_and_context
+        results = {}
 
-        if not agent_state:
-            continue
+        for step in sorted(plan, key=lambda x: x['priority']):
+            agent_name = step['agent']
+            agent_state = agents_copy.get(agent_name)
 
-        if agent_name == 'vision':
-            agent_state, result = vision_agent_perceive(
-                agent_state,
-                context['image']
-            )
-            results['vision'] = result
-            context['damage_info'] = result
+            if not agent_state:
+                continue
 
-        elif agent_name.startswith('cost_'):
-            agent_state, result = cost_agent_estimate(
-                agent_state,
-                context['damage_info'],
-                context['location'],
-                context['currency']
-            )
-            results[agent_name] = result
+            if agent_name == 'vision':
+                agent_state, result = vision_agent_perceive(
+                    agent_state,
+                    context['image']
+                )
+                results['vision'] = result
+                context['damage_info'] = result
 
-        elif agent_name == 'shop_finder':
-            agent_state, result = shop_finder_search(
-                agent_state,
-                context['location']
-            )
-            results['shops'] = result
+            elif agent_name.startswith('cost_'):
+                agent_state, result = cost_agent_estimate(
+                    agent_state,
+                    context['damage_info'],
+                    context['location'],
+                    context['currency']
+                )
+                results[agent_name] = result
 
-        agents[agent_name] = agent_state
+            elif agent_name == 'shop_finder':
+                agent_state, result = shop_finder_search(
+                    agent_state,
+                    context['location']
+                )
+                results['shops'] = result
+
+            agents_copy[agent_name] = agent_state
+
+        observation = (
+            f"All {len(results)} agent tasks completed: "
+            + ", ".join(results.keys()) + "."
+        )
+        return results, observation
+
+    # Pack agents into the input tuple so the closure can access it
+    orchestrator_state, results = react_run_loop(
+        orchestrator_state,
+        thought_text=(
+            f"I have a plan with {len(plan)} steps. "
+            f"I will execute each agent in priority order: vision first, "
+            f"then cost estimators, then shop finder, "
+            f"passing results downstream as context."
+        ),
+        action_name="execute_agent_plan",
+        action_fn=lambda inp: run_all_steps(inp),
+        action_input=(plan, context, agents)
+    )
 
     orchestrator_state = update_agent_memory(orchestrator_state, {
         'action': 'execution_completed',
@@ -516,6 +743,42 @@ def orchestrator_execute(orchestrator_state, plan, agents, context):
     })
 
     return orchestrator_state, results
+
+# --- ReAct Trace Formatter ---
+
+def format_react_traces(orchestrator, agents):
+    """Format all agents' ReAct traces into a readable markdown string"""
+    ICONS = {'Thought': '💭', 'Action': '⚡', 'Observation': '👁️'}
+    AGENT_LABELS = {
+        'orchestrator': '🎯 Orchestrator',
+        'vision':       '👁️ Vision Agent',
+        'cost_primary': '💎 Cost Agent — OEM',
+        'cost_alternative': '💰 Cost Agent — Aftermarket',
+        'shop_finder':  '🛠️ Shop Finder Agent',
+    }
+
+    all_states = {'orchestrator': orchestrator, **agents}
+    lines = []
+
+    for agent_key, state in all_states.items():
+        trace = state.get('react_trace', [])
+        if not trace:
+            continue
+        label = AGENT_LABELS.get(agent_key, agent_key)
+        lines.append(f"### {label}")
+        for i, step in enumerate(trace, 1):
+            icon = ICONS.get(step['step'], '•')
+            ts = step['timestamp'][11:19]  # HH:MM:SS
+            lines.append(f"**{icon} {step['step']}** <sub>{ts}</sub>")
+            content = step['content']
+            if step['step'] == 'Action' and step.get('input'):
+                lines.append(f"> `{content}`")
+            else:
+                lines.append(f"> {content}")
+            lines.append("")  # blank line between steps
+
+    return "\n".join(lines) if lines else "_No trace available._"
+
 
 # --- Main Analysis Function ---
 
@@ -533,13 +796,13 @@ def analyze_with_multi_agent_system(perplexity_key, openai_key, image, location)
     openai_key = openai_key or os.environ.get("OPENAI_API_KEY")
 
     if not perplexity_key:
-        return "⚠️ Perplexity API Key Required", "N/A", "N/A", ""
+        return "⚠️ Perplexity API Key Required", "N/A", "N/A", "", "_No trace — missing API key._"
 
     if not openai_key:
-        return "⚠️ OpenAI API Key Required", "N/A", "N/A", ""
+        return "⚠️ OpenAI API Key Required", "N/A", "N/A", "", "_No trace — missing API key._"
 
     if not image:
-        return "Please upload an image", "N/A", "N/A", ""
+        return "Please upload an image", "N/A", "N/A", "", "_No trace — no image uploaded._"
 
     currency, currency_symbol = detect_currency_from_location(location)
     location = location or "European Union"
@@ -614,10 +877,10 @@ def analyze_with_multi_agent_system(perplexity_key, openai_key, image, location)
 
 {shops}"""
 
-        return description_output, primary_output, alternative_output, shops_output
+        return description_output, primary_output, alternative_output, shops_output, format_react_traces(orchestrator, agents)
 
     except Exception as e:
-        return f"❌ Analysis Failed: {str(e)}", "N/A", "N/A", ""
+        return f"❌ Analysis Failed: {str(e)}", "N/A", "N/A", "", f"_Error during execution: {str(e)}_"
 
 
 # --- Gradio Interface ---
@@ -691,10 +954,16 @@ def build_interface():
 
         shops_output = gr.Markdown("Shop results will appear here...")
 
+        with gr.Accordion("🔍 ReAct Trace — Agent Reasoning Log", open=False):
+            gr.Markdown(
+                "<sub>Shows each agent's Thought → Action → Observation loop. Expand after running an analysis.</sub>"
+            )
+            react_trace_output = gr.Markdown("_Run an analysis to see the ReAct trace._")
+
         analyze_btn.click(
             fn=analyze_with_multi_agent_system,
             inputs=[perplexity_key_input, openai_key_input, image_input, location_input],
-            outputs=[description_output, primary_cost_output, alternative_cost_output, shops_output],
+            outputs=[description_output, primary_cost_output, alternative_cost_output, shops_output, react_trace_output],
             show_progress=True
         )
 
