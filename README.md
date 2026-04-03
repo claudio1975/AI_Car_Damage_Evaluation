@@ -39,6 +39,6 @@ streamlit run app_streamlit_multiagent.py # streamlit app
 
 go to hugging face app: -> https://huggingface.co/spaces/towardsinnovationlab/AI_Car_Damage_Evaluation
 
-go to streamlit app -> https://aicardamageevaluation.streamlit.app/
+go to streamlit app -> https://cardamageevaluation.streamlit.app/
 
 
