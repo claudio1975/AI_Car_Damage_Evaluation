@@ -786,7 +786,7 @@ def analyze_with_multi_agent_system(perplexity_key, openai_key, image, location)
     Multi-agent system with orchestrator pattern:
     1. Orchestrator creates execution plan
     2. Vision agent analyzes image (autonomous decision on quality)
-    3. Cost agents estimate in parallel (decide strategy based on severity)
+    3. Cost agents estimate sequentially (decide strategy based on severity)
     4. Shop finder agent searches (decides based on location)
     5. Orchestrator aggregates results
     """
