@@ -41,4 +41,4 @@ go to hugging face app: -> https://huggingface.co/spaces/towardsinnovationlab/AI
 
 go to streamlit app -> https://cardamageevaluation.streamlit.app/
 
-
+go to google ai studio app -> https://multi-agent-car-damage-evaluation.ai.studio/ 
